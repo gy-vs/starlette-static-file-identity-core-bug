@@ -1,5 +1,6 @@
 import os
 import stat
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -526,7 +527,7 @@ def test_staticfiles_unhandled_os_error_returns_500(
     app = Starlette(routes=routes)
     client = test_client_factory(app, raise_server_exceptions=False)
 
-    monkeypatch.setattr("starlette.staticfiles.StaticFiles.lookup_path", mock_timeout)
+    monkeypatch.setattr("starlette.staticfiles.StaticFiles._lookup_path_pinned", mock_timeout)
 
     response = client.get("/example.txt")
     assert response.status_code == 500
@@ -678,3 +679,236 @@ def test_staticfiles_relative_directory_symlinks(test_client_factory: TestClient
     response = client.get("/example.txt")
     assert response.status_code == 200
     assert response.text == "123\n"
+
+
+def _collect_asgi_response(app: StaticFiles, scope: dict[str, Any], on_start: Any = None) -> dict[str, Any]:
+    """Call an ASGI app directly and return status, headers and full body."""
+    messages: list[dict[str, Any]] = []
+
+    async def receive() -> dict[str, Any]:
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message: dict[str, Any]) -> None:
+        if on_start is not None and message["type"] == "http.response.start":
+            # Run the directory update in a worker thread, like the external
+            # process that actually replaces the files.
+            await anyio.to_thread.run_sync(on_start)
+        messages.append(message)
+
+    full_scope = {
+        "type": "http",
+        "method": scope.get("method", "GET"),
+        "path": scope["path"],
+        "headers": [(k.encode(), v.encode()) for k, v in scope.get("headers", [])],
+        "root_path": "",
+        "query_string": b"",
+        "asgi": {"version": "3.0", "spec_version": "2.4"},
+        "scheme": "http",
+        "server": ("testserver", 80),
+        "client": ("testclient", 123),
+    }
+    anyio.run(app, full_scope, receive, send)
+    start = next(message for message in messages if message["type"] == "http.response.start")
+    body = b"".join(message.get("body", b"") for message in messages if message["type"] == "http.response.body")
+    headers = {name.decode(): value.decode() for name, value in start["headers"]}
+    return {"status": start["status"], "headers": headers, "body": body}
+
+
+def _scope(path: str, method: str = "GET", headers: list[tuple[str, str]] | None = None) -> dict[str, Any]:
+    return {"path": path, "method": method, "headers": headers or []}
+
+
+def test_staticfiles_swap_to_outside_symlink_still_serves_checked_file(tmp_path: Path) -> None:
+    # The checked public file and the outside file happen to be the same size,
+    # so status code and Content-Length alone would not reveal the mismatch.
+    public = tmp_path / "public"
+    private = tmp_path / "private"
+    slot = public / "slot"
+    slot.mkdir(parents=True)
+    private.mkdir()
+    (slot / "asset.txt").write_text("PUBLIC_CONTENT")
+    (private / "asset.txt").write_text("PRIVATE_SECRET")
+
+    app = StaticFiles(directory=public)
+    swapped = False
+
+    def swap() -> None:
+        nonlocal swapped
+        if not swapped:
+            slot.rename(public / "slot.bak")
+            slot.symlink_to(private, target_is_directory=True)
+            swapped = True
+
+    result = _collect_asgi_response(app, _scope("/slot/asset.txt"), on_start=swap)
+
+    assert result["status"] == 200
+    assert result["body"] == b"PUBLIC_CONTENT"
+    # Headers describe the checked file; length and body agree.
+    assert result["headers"]["content-length"] == str(len(b"PUBLIC_CONTENT"))
+
+
+def test_staticfiles_swap_to_different_sized_file_keeps_metadata_consistent(
+    tmp_path: Path,
+) -> None:
+    public = tmp_path / "public"
+    private = tmp_path / "private"
+    slot = public / "slot"
+    slot.mkdir(parents=True)
+    private.mkdir()
+    (slot / "asset.txt").write_text("PUBLIC_CONTENT")
+    (private / "asset.txt").write_text("PRIVATE_SECRET_THAT_IS_MUCH_LONGER")
+
+    app = StaticFiles(directory=public)
+
+    def swap() -> None:
+        slot.rename(public / "slot.bak")
+        slot.symlink_to(private, target_is_directory=True)
+
+    result = _collect_asgi_response(app, _scope("/slot/asset.txt"), on_start=swap)
+
+    assert result["status"] == 200
+    assert result["body"] == b"PUBLIC_CONTENT"
+    assert int(result["headers"]["content-length"]) == len(result["body"])
+
+
+def test_staticfiles_range_request_pinned_against_swap(tmp_path: Path) -> None:
+    public = tmp_path / "public"
+    private = tmp_path / "private"
+    slot = public / "slot"
+    slot.mkdir(parents=True)
+    private.mkdir()
+    (slot / "big.bin").write_bytes(b"0123456789ABCDEFGHIJ")
+    (private / "big.bin").write_bytes(b"X" * 20)
+
+    app = StaticFiles(directory=public)
+
+    def swap() -> None:
+        slot.rename(public / "slot.bak")
+        slot.symlink_to(private, target_is_directory=True)
+
+    result = _collect_asgi_response(app, _scope("/slot/big.bin", headers=[("range", "bytes=2-5")]), on_start=swap)
+
+    assert result["status"] == 206
+    assert result["body"] == b"2345"
+    assert result["headers"]["content-range"] == "bytes 2-5/20"
+
+
+def test_staticfiles_head_request_pinned_against_swap(tmp_path: Path) -> None:
+    public = tmp_path / "public"
+    private = tmp_path / "private"
+    slot = public / "slot"
+    slot.mkdir(parents=True)
+    private.mkdir()
+    (slot / "asset.txt").write_text("PUBLIC_CONTENT")
+    (private / "asset.txt").write_text("PRIVATE_SECRET")
+
+    app = StaticFiles(directory=public)
+
+    def swap() -> None:
+        slot.rename(public / "slot.bak")
+        slot.symlink_to(private, target_is_directory=True)
+
+    result = _collect_asgi_response(app, _scope("/slot/asset.txt", method="HEAD"), on_start=swap)
+
+    assert result["status"] == 200
+    assert result["body"] == b""
+    assert result["headers"]["content-length"] == str(len(b"PUBLIC_CONTENT"))
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="/proc/self/fd is Linux-only")
+def test_staticfiles_pinned_handle_closed_on_not_modified(tmp_path: Path) -> None:
+    (tmp_path / "example.txt").write_text("<file content>")
+    app = StaticFiles(directory=tmp_path)
+
+    first = _collect_asgi_response(app, _scope("/example.txt"))
+    etag = first["headers"]["etag"]
+
+    fds_before = len(os.listdir(f"/proc/{os.getpid()}/fd"))
+    for _ in range(10):
+        result = _collect_asgi_response(app, _scope("/example.txt", headers=[("if-none-match", etag)]))
+        assert result["status"] == 304
+    fds_after = len(os.listdir(f"/proc/{os.getpid()}/fd"))
+
+    assert fds_after <= fds_before + 1
+
+
+def test_staticfiles_restricted_internal_relative_symlink_served(tmp_path: Path) -> None:
+    (tmp_path / "plain.txt").write_text("HELLO_WORLD")
+    (tmp_path / "sub").mkdir()
+    (tmp_path / "sub" / "up.txt").symlink_to("../plain.txt")
+
+    app = StaticFiles(directory=tmp_path)
+    result = _collect_asgi_response(app, _scope("/sub/up.txt"))
+
+    assert result["status"] == 200
+    assert result["body"] == b"HELLO_WORLD"
+
+
+def test_staticfiles_restricted_relative_symlink_escaping_root_rejected(tmp_path: Path) -> None:
+    outside = tmp_path / "outside"
+    public = tmp_path / "public"
+    outside.mkdir()
+    public.mkdir()
+    (outside / "secret.txt").write_text("PRIVATE_SECRET")
+    link = public / "escape.txt"
+    link.symlink_to("../outside/secret.txt")
+
+    app = StaticFiles(directory=public)
+
+    with pytest.raises(HTTPException) as exc_info:
+        anyio.run(app.get_response, app.get_path({"path": "/escape.txt"}), {"method": "GET"})
+
+    assert exc_info.value.status_code == 404
+
+
+def test_staticfiles_restricted_internal_directory_symlink_served(tmp_path: Path) -> None:
+    # A symlink that points at another directory *inside* the root is allowed
+    # even with symlink following disabled (its realpath stays within root).
+    (tmp_path / "real" / "nested").mkdir(parents=True)
+    (tmp_path / "real" / "nested" / "page.txt").write_text("INSIDE")
+    (tmp_path / "link").symlink_to(tmp_path / "real", target_is_directory=True)
+
+    app = StaticFiles(directory=tmp_path)
+    result = _collect_asgi_response(app, _scope("/link/nested/page.txt"))
+
+    assert result["status"] == 200
+    assert result["body"] == b"INSIDE"
+
+
+def test_staticfiles_restricted_absolute_symlink_outside_root_rejected(tmp_path: Path) -> None:
+    outside = tmp_path / "outside"
+    public = tmp_path / "public"
+    outside.mkdir()
+    public.mkdir()
+    (outside / "secret.txt").write_text("PRIVATE_SECRET")
+    (public / "escape.txt").symlink_to(outside / "secret.txt")
+
+    app = StaticFiles(directory=public)
+
+    with pytest.raises(HTTPException) as exc_info:
+        anyio.run(app.get_response, app.get_path({"path": "/escape.txt"}), {"method": "GET"})
+
+    assert exc_info.value.status_code == 404
+
+
+def test_staticfiles_follow_symlink_swap_pins_checked_target(tmp_path: Path) -> None:
+    served = tmp_path / "served"
+    served.mkdir()
+    target_a = tmp_path / "a.txt"
+    target_b = tmp_path / "b.txt"
+    target_a.write_text("AAAA")
+    target_b.write_text("BBBBBBBB")
+    link = served / "link.txt"
+    link.symlink_to(target_a)
+
+    app = StaticFiles(directory=served, follow_symlink=True)
+
+    def swap() -> None:
+        link.unlink()
+        link.symlink_to(target_b)
+
+    result = _collect_asgi_response(app, _scope("/link.txt"), on_start=swap)
+
+    assert result["status"] == 200
+    assert result["body"] == b"AAAA"
+    assert result["headers"]["content-length"] == "4"

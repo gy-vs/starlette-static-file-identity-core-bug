@@ -13,7 +13,7 @@ from email.utils import format_datetime, formatdate
 from functools import partial
 from mimetypes import guess_type
 from secrets import token_hex
-from typing import Any, Literal
+from typing import IO, Any, Literal
 from urllib.parse import quote
 
 import anyio
@@ -310,10 +310,16 @@ class FileResponse(Response):
         filename: str | None = None,
         stat_result: os.stat_result | None = None,
         content_disposition_type: str = "attachment",
+        file: IO[bytes] | None = None,
     ) -> None:
         self.path = path
         self.status_code = status_code
         self.filename = filename
+        # When an already open file is provided (e.g. by StaticFiles, which
+        # must pin the file it access-checked), the response body is read from
+        # this handle instead of re-opening `path`, so that a later replacement
+        # of the path (rename, symlink swap...) cannot change what is sent.
+        self.file = file
         if media_type is None:
             media_type = guess_type(filename or path)[0] or "application/octet-stream"
         self.media_type = media_type
@@ -347,10 +353,18 @@ class FileResponse(Response):
         send_pathsend = scope_type == "http" and "http.response.pathsend" in scope.get("extensions", {})
         if scope_type == "websocket":
             send = self._wrap_websocket_denial_send(send)
+        # A pinned handle always identifies the file that was checked; handing
+        # its path to pathsend would allow the server to resolve a different
+        # file at transfer time.
+        if self.file is not None:
+            send_pathsend = False
 
         if self.stat_result is None:
             try:
-                stat_result = await anyio.to_thread.run_sync(os.stat, self.path)
+                if self.file is not None:
+                    stat_result = await anyio.to_thread.run_sync(os.fstat, self.file.fileno())
+                else:
+                    stat_result = await anyio.to_thread.run_sync(os.stat, self.path)
                 self.set_stat_headers(stat_result)
             except FileNotFoundError:
                 raise RuntimeError(f"File at path {self.path} does not exist.")
@@ -361,6 +375,26 @@ class FileResponse(Response):
         else:
             stat_result = self.stat_result
 
+        # The caller owns the pinned handle's lifetime for the duration of the
+        # response, including every early-return branch below.
+        try:
+            await self._send(scope, receive, send, send_header_only, send_pathsend, stat_result)
+        finally:
+            if self.file is not None:
+                # Closing must finish even when the transfer is cancelled.
+                with anyio.CancelScope(shield=True):
+                    await anyio.to_thread.run_sync(self.file.close)
+                self.file = None
+
+    async def _send(
+        self,
+        scope: Scope,
+        receive: Receive,
+        send: Send,
+        send_header_only: bool,
+        send_pathsend: bool,
+        stat_result: os.stat_result,
+    ) -> None:
         headers = Headers(scope=scope)
         http_range = headers.get("range")
         http_if_range = headers.get("if-range")
@@ -391,7 +425,7 @@ class FileResponse(Response):
                 send_pathsend = False
 
         spec_version = tuple(map(int, scope.get("asgi", {}).get("spec_version", "2.0").split(".")))
-        if scope_type != "http" or send_header_only or send_pathsend or spec_version >= (2, 4):
+        if scope["type"] != "http" or send_header_only or send_pathsend or spec_version >= (2, 4):
             await send_file()
         else:
             async with create_collapsing_task_group() as task_group:
@@ -412,13 +446,23 @@ class FileResponse(Response):
     # TODO: Remove this wrapper once minimum AnyIO includes https://github.com/agronholm/anyio/pull/1314.
     @asynccontextmanager
     async def _open_file(self) -> AsyncIterator[anyio.AsyncFile[bytes]]:
-        file = await anyio.open_file(self.path, mode="rb")
-        try:
-            yield file
-        finally:
-            # Closing must finish even when the transfer is cancelled.
-            with anyio.CancelScope(shield=True):
-                await file.aclose()
+        if self.file is not None:
+            # Take ownership of the pinned handle for the duration of the read.
+            file_obj, self.file = self.file, None
+            file = anyio.AsyncFile(file_obj)
+            try:
+                yield file
+            finally:
+                with anyio.CancelScope(shield=True):
+                    await file.aclose()
+        else:
+            file = await anyio.open_file(self.path, mode="rb")
+            try:
+                yield file
+            finally:
+                # Closing must finish even when the transfer is cancelled.
+                with anyio.CancelScope(shield=True):
+                    await file.aclose()
 
     async def _handle_simple(self, send: Send, send_header_only: bool, send_pathsend: bool) -> None:
         await send({"type": "http.response.start", "status": self.status_code, "headers": self.raw_headers})
