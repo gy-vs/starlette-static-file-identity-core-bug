@@ -13,7 +13,7 @@ from email.utils import format_datetime, formatdate
 from functools import partial
 from mimetypes import guess_type
 from secrets import token_hex
-from typing import Any, Literal
+from typing import IO, Any, Literal
 from urllib.parse import quote
 
 import anyio
@@ -310,6 +310,7 @@ class FileResponse(Response):
         filename: str | None = None,
         stat_result: os.stat_result | None = None,
         content_disposition_type: str = "attachment",
+        file: IO[bytes] | None = None,
     ) -> None:
         self.path = path
         self.status_code = status_code
@@ -327,6 +328,7 @@ class FileResponse(Response):
             else:
                 content_disposition = f'{content_disposition_type}; filename="{self.filename}"'
             self.headers.setdefault("content-disposition", content_disposition)
+        self.file = file
         self.stat_result = stat_result
         if stat_result is not None:
             self.set_stat_headers(stat_result)
@@ -344,9 +346,34 @@ class FileResponse(Response):
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         scope_type = scope["type"]
         send_header_only = scope_type == "http" and scope["method"].upper() == "HEAD"
-        send_pathsend = scope_type == "http" and "http.response.pathsend" in scope.get("extensions", {})
+        # pathsend hands the path string back to the server, which would
+        # re-resolve it from disk; we cannot do that for a file that was
+        # opened and authorized through a descriptor.
+        send_pathsend = (
+            self.file is None
+            and scope_type == "http"
+            and "http.response.pathsend" in scope.get("extensions", {})
+        )
         if scope_type == "websocket":
             send = self._wrap_websocket_denial_send(send)
+
+        try:
+            await self._send(scope, receive, send, send_header_only, send_pathsend)
+        finally:
+            # A file supplied by the caller has been bound to this response;
+            # it must not outlive the request, however the transfer ends.
+            if self.file is not None and not self.file.closed:
+                # Closing must finish even when the transfer is cancelled.
+                with anyio.CancelScope(shield=True):
+                    await anyio.to_thread.run_sync(self.file.close)
+
+        if self.background is not None:
+            await self.background()
+
+    async def _send(
+        self, scope: Scope, receive: Receive, send: Send, send_header_only: bool, send_pathsend: bool
+    ) -> None:
+        scope_type = scope["type"]
 
         if self.stat_result is None:
             try:
@@ -406,12 +433,17 @@ class FileResponse(Response):
                         task_group.cancel_scope.cancel()
                         break
 
-        if self.background is not None:
-            await self.background()
-
     # TODO: Remove this wrapper once minimum AnyIO includes https://github.com/agronholm/anyio/pull/1314.
     @asynccontextmanager
     async def _open_file(self) -> AsyncIterator[anyio.AsyncFile[bytes]]:
+        if self.file is not None:
+            # The caller already opened and authorized the file; read from
+            # that exact descriptor so the body cannot be switched out from
+            # under the validated metadata.  Ownership (and therefore
+            # closing) stays with FileResponse.__call__.
+            yield anyio.wrap_file(self.file)
+            return
+
         file = await anyio.open_file(self.path, mode="rb")
         try:
             yield file

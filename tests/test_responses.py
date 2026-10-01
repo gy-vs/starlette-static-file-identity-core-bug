@@ -538,6 +538,61 @@ async def test_file_response_closes_on_send_error(
     assert files[0].closed
 
 
+@pytest.mark.anyio
+async def test_file_response_uses_and_closes_provided_file(tmp_path: Path) -> None:
+    path = tmp_path / "file.bin"
+    path.write_bytes(b"x" * (8 * FileResponse.chunk_size))
+
+    scope: Scope = {"type": "http", "method": "GET", "headers": [], "asgi": {"spec_version": "2.4"}}
+    messages: list[Message] = []
+
+    async def receive() -> Message:
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message: Message) -> None:
+        messages.append(message)
+
+    file = open(path, "rb")
+    response = FileResponse(path, file=file, stat_result=os.fstat(file.fileno()))
+    await response(scope, receive, send)
+
+    body = b"".join(message.get("body", b"") for message in messages if message["type"] == "http.response.body")
+    assert body == b"x" * (8 * FileResponse.chunk_size)
+    assert file.closed
+
+
+@pytest.mark.anyio
+async def test_file_response_provided_file_ignores_pathsend_and_sends_bytes(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "file.bin"
+    path.write_bytes(b"abc")
+
+    scope: Scope = {
+        "type": "http",
+        "method": "GET",
+        "headers": [],
+        "asgi": {"spec_version": "2.4"},
+        "extensions": {"http.response.pathsend": {}},
+    }
+    messages: list[Message] = []
+
+    async def receive() -> Message:
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message: Message) -> None:
+        messages.append(message)
+
+    file = open(path, "rb")
+    response = FileResponse(path, file=file, stat_result=os.fstat(file.fileno()))
+    await response(scope, receive, send)
+
+    assert not any(message["type"] == "http.response.pathsend" for message in messages)
+    body = b"".join(message.get("body", b"") for message in messages if message["type"] == "http.response.body")
+    assert body == b"abc"
+    assert file.closed
+
+
 def test_set_cookie(test_client_factory: TestClientFactory, monkeypatch: pytest.MonkeyPatch) -> None:
     # Mock time used as a reference for `Expires` by stdlib `SimpleCookie`.
     mocked_now = dt.datetime(2037, 1, 22, 12, 0, 0, tzinfo=dt.UTC)

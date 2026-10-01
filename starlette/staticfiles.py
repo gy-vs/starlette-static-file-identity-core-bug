@@ -4,8 +4,9 @@ import errno
 import importlib.util
 import os
 import stat
+import sys
 from email.utils import parsedate
-from typing import Union
+from typing import IO, Union
 
 import anyio
 import anyio.to_thread
@@ -120,7 +121,7 @@ class StaticFiles:
             raise HTTPException(status_code=405)
 
         try:
-            full_path, stat_result = await anyio.to_thread.run_sync(self.lookup_path, path)
+            file, full_path, stat_result = await anyio.to_thread.run_sync(self.lookup_file, path)
         except PermissionError:
             raise HTTPException(status_code=401)
         except OSError as exc:
@@ -133,28 +134,35 @@ class StaticFiles:
             # Null bytes or other invalid characters in the path.
             raise HTTPException(status_code=404)
 
-        if stat_result and stat.S_ISREG(stat_result.st_mode):
-            # We have a static file to serve.
-            return self.file_response(full_path, stat_result, scope)
+        if file is not None:
+            # We have a static file to serve.  The file is already open, so
+            # its stat result and the bytes sent to the client describe the
+            # very same file, even if the directory tree changes while the
+            # response is being built or transmitted.
+            assert stat_result is not None
+            return self.file_response(file, full_path, stat_result, scope)
 
-        elif stat_result and stat.S_ISDIR(stat_result.st_mode) and self.html:
+        if stat_result is not None and stat.S_ISDIR(stat_result.st_mode) and self.html:
             # We're in HTML mode, and have got a directory URL.
             # Check if we have 'index.html' file to serve.
             index_path = os.path.join(path, "index.html")
-            full_path, stat_result = await anyio.to_thread.run_sync(self.lookup_path, index_path)
-            if stat_result is not None and stat.S_ISREG(stat_result.st_mode):
+            file, full_path, stat_result = await anyio.to_thread.run_sync(self.lookup_file, index_path)
+            if file is not None:
+                assert stat_result is not None
                 if not scope["path"].endswith("/"):
                     # Directory URLs should redirect to always end in "/".
                     url = URL(scope=scope)
                     url = url.replace(path=url.path + "/")
+                    file.close()
                     return RedirectResponse(url=url)
-                return self.file_response(full_path, stat_result, scope)
+                return self.file_response(file, full_path, stat_result, scope)
 
         if self.html:
             # Check for '404.html' if we're in HTML mode.
-            full_path, stat_result = await anyio.to_thread.run_sync(self.lookup_path, "404.html")
-            if stat_result and stat.S_ISREG(stat_result.st_mode):
-                return FileResponse(full_path, stat_result=stat_result, status_code=404)
+            file, full_path, stat_result = await anyio.to_thread.run_sync(self.lookup_file, "404.html")
+            if file is not None:
+                assert stat_result is not None
+                return FileResponse(full_path, file=file, stat_result=stat_result, status_code=404)
         raise HTTPException(status_code=404)
 
     def lookup_path(self, path: str) -> tuple[str, os.stat_result | None]:
@@ -178,8 +186,144 @@ class StaticFiles:
                 continue
         return "", None
 
+    def lookup_file(
+        self, path: str
+    ) -> tuple[IO[bytes] | None, str, os.stat_result | None]:
+        """
+        Resolve ``path`` within the configured directories and return an
+        already-open binary file object together with its stat result when
+        it names a regular file.
+
+        Path resolution is the same as in :meth:`lookup_path`, but in
+        addition the file is opened and the opened descriptor is verified
+        to still reside inside the served directory.  Binding the access
+        check to an open file descriptor (rather than to a path string)
+        ensures the response metadata and the bytes that are eventually sent
+        describe the same file.  Replacing a directory or swapping in a
+        symlink after this lookup cannot redirect the open descriptor to
+        content outside the served tree.
+
+        Directories are returned as ``(None, full_path, stat_result)`` so
+        html mode can still discover and redirect to them.
+        """
+        resolved_path, _ = self.lookup_path(path)
+        if not resolved_path:
+            return None, "", None
+
+        root = self._root_for(resolved_path)
+        if root is None:
+            return None, "", None
+
+        try:
+            fd = self._open_fd(resolved_path)
+        except (FileNotFoundError, NotADirectoryError):
+            # The tree changed between resolution and opening; the request
+            # can simply fail as if the file had never existed.
+            return None, "", None
+
+        file = None
+        try:
+            if not self.follow_symlink and not self._fd_is_within(fd, root):
+                # The opened descriptor resolves outside of the served
+                # directory: a directory component was renamed or a symlink
+                # was swapped in between path resolution and opening.
+                return None, "", None
+
+            stat_result = os.fstat(fd)
+            if stat.S_ISDIR(stat_result.st_mode):
+                # Directories are reported without a file so html mode can
+                # discover and redirect to them.
+                return None, resolved_path, stat_result
+            if not stat.S_ISREG(stat_result.st_mode):
+                return None, "", None
+
+            # Wrap the descriptor; ownership is transferred to the caller,
+            # which closes it once the response has been sent.
+            file = os.fdopen(fd, "rb")
+            return file, resolved_path, stat_result
+        finally:
+            if file is None:
+                # fdopen() did not take ownership of the descriptor.
+                os.close(fd)
+
+    def _root_for(self, resolved_path: str) -> str | None:
+        """
+        Return the configured directory containing ``resolved_path``, after
+        both sides have been canonicalized in the same way.
+        """
+        for directory in self.all_directories:
+            root = os.path.abspath(directory) if self.follow_symlink else os.path.realpath(directory)
+            try:
+                if os.path.commonpath([resolved_path, root]) == root:
+                    return root
+            except ValueError:
+                continue
+        return None
+
+    def _open_fd(self, full_path: str) -> int:
+        """
+        Open ``full_path`` for reading, returning its file descriptor.  When
+        symlinks are disabled the final path component is not followed.
+        """
+        flags = os.O_RDONLY
+        if not self.follow_symlink and sys.platform != "win32" and hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            return os.open(full_path, flags)
+        except OSError as exc:
+            if (
+                not self.follow_symlink
+                and sys.platform != "win32"
+                and hasattr(errno, "ELOOP")
+                and exc.errno == errno.ELOOP
+            ):
+                # The final component is a symlink.  Resolve it explicitly;
+                # the descriptor is then validated against the served
+                # directory.  Symlinks to files *inside* the tree therefore
+                # keep working while follow_symlink is disabled, while a
+                # link pointing (or switched) outside of it is rejected.
+                return os.open(full_path, os.O_RDONLY)
+            raise
+
+    def _fd_is_within(self, fd: int, root: str) -> bool:
+        """
+        Return whether the file backing an open descriptor resides within
+        ``root``.
+
+        On Linux the descriptor's kernel-managed path (``/proc/self/fd``)
+        is inspected: unlike re-statting a path string, it cannot be
+        fooled by renaming directories or replacing symlinks after the
+        file was opened.  Elsewhere the check falls back to ``O_NOFOLLOW``
+        semantics established while opening.
+        """
+        resolved = self._fd_realpath(fd)
+        if resolved is None:
+            # No descriptor-based path is available; the O_NOFOLLOW open
+            # already prevented the final component from being a link.
+            return True
+        try:
+            return os.path.commonpath([resolved, root]) == root
+        except ValueError:
+            return False
+
+    @staticmethod
+    def _fd_realpath(fd: int) -> str | None:
+        if sys.platform.startswith("linux"):
+            candidates = (f"/proc/self/fd/{fd}",)
+        elif sys.platform == "darwin" or sys.platform.startswith(("freebsd", "netbsd", "openbsd")):
+            candidates = (f"/dev/fd/{fd}",)
+        else:
+            return None
+        for candidate in candidates:
+            try:
+                return os.path.realpath(candidate)
+            except OSError:
+                continue
+        return None
+
     def file_response(
         self,
+        file: IO[bytes],
         full_path: PathLike,
         stat_result: os.stat_result,
         scope: Scope,
@@ -187,8 +331,10 @@ class StaticFiles:
     ) -> Response:
         request_headers = Headers(scope=scope)
 
-        response = FileResponse(full_path, status_code=status_code, stat_result=stat_result)
+        response = FileResponse(full_path, file=file, status_code=status_code, stat_result=stat_result)
         if self.is_not_modified(response.headers, request_headers):
+            # No body will be sent, so the checked file is no longer needed.
+            file.close()
             return NotModifiedResponse(response.headers)
         return response
 

@@ -16,6 +16,7 @@ from starlette.requests import Request
 from starlette.responses import Response
 from starlette.routing import Mount
 from starlette.staticfiles import StaticFiles
+from starlette.types import Receive, Scope, Send
 from starlette.websockets import WebSocketDisconnect
 from tests.types import TestClientFactory
 
@@ -678,3 +679,127 @@ def test_staticfiles_relative_directory_symlinks(test_client_factory: TestClient
     response = client.get("/example.txt")
     assert response.status_code == 200
     assert response.text == "123\n"
+
+
+def test_staticfiles_serves_opened_file_when_directory_is_replaced(
+    tmp_path: Path, test_client_factory: TestClientFactory
+) -> None:
+    """
+    Replacing a directory component with a symlink after StaticFiles has
+    accepted the request must not make the response read content from
+    outside the served directory.  The checked file, its metadata and the
+    bytes that are sent must all describe the same file.
+    """
+    public = tmp_path / "public"
+    private = tmp_path / "private"
+    slot = public / "slot"
+    public.mkdir()
+    private.mkdir()
+    slot.mkdir()
+    (slot / "asset.txt").write_text("PUBLIC_CONTENT")
+    (private / "asset.txt").write_text("PRIVATE_SECRET")
+
+    static = StaticFiles(directory=public)
+
+    async def swap_after_lookup(scope: Scope, receive: Receive, send: Send) -> None:
+        # StaticFiles.get_response performs the access check and opens the
+        # file; swap the directory only once that has happened.
+        response = await static.get_response("slot/asset.txt", scope)
+        slot_moved = public / "slot_moved"
+        os.rename(slot, slot_moved)
+        os.symlink(private, slot)
+        try:
+            await response(scope, receive, send)
+        finally:
+            os.unlink(slot)
+            os.rename(slot_moved, slot)
+
+    client = test_client_factory(swap_after_lookup)
+    response = client.get("/slot/asset.txt")
+
+    assert response.status_code == 200
+    assert response.text == "PUBLIC_CONTENT"
+    assert response.headers["content-length"] == str(len("PUBLIC_CONTENT"))
+
+
+def test_staticfiles_swap_with_different_sized_file_keeps_checked_metadata(
+    tmp_path: Path, test_client_factory: TestClientFactory
+) -> None:
+    public = tmp_path / "public"
+    private = tmp_path / "private"
+    slot = public / "slot"
+    public.mkdir()
+    private.mkdir()
+    slot.mkdir()
+    (slot / "asset.txt").write_text("PUBLIC_CONTENT")
+    (private / "asset.txt").write_text("A COMPLETELY DIFFERENT AND LONGER PRIVATE SECRET")
+
+    static = StaticFiles(directory=public)
+
+    async def swap_after_lookup(scope: Scope, receive: Receive, send: Send) -> None:
+        response = await static.get_response("slot/asset.txt", scope)
+        slot_moved = public / "slot_moved"
+        os.rename(slot, slot_moved)
+        os.symlink(private, slot)
+        try:
+            await response(scope, receive, send)
+        finally:
+            os.unlink(slot)
+            os.rename(slot_moved, slot)
+
+    client = test_client_factory(swap_after_lookup)
+    response = client.get("/slot/asset.txt")
+
+    assert response.status_code == 200
+    assert response.text == "PUBLIC_CONTENT"
+    assert len(response.content) == len("PUBLIC_CONTENT")
+    assert response.headers["content-length"] == str(len("PUBLIC_CONTENT"))
+
+
+def test_staticfiles_rejects_symlink_swapped_in_after_lookup(tmp_path: Path) -> None:
+    """
+    With follow_symlink disabled, a symlink that appears at the final path
+    component (only after the path check resolved a regular file) must not
+    be followed out of the served directory.
+    """
+    public = tmp_path / "public"
+    private = tmp_path / "private"
+    public.mkdir()
+    private.mkdir()
+    (public / "asset.txt").write_text("PUBLIC_CONTENT")
+    (private / "asset.txt").write_text("PRIVATE_SECRET")
+
+    app = StaticFiles(directory=public)
+
+    # Resolve and validate the path while it is still a regular file, then
+    # replace it with a symlink pointing outside of the served directory.
+    full_path, _ = app.lookup_path("asset.txt")
+    assert full_path
+    (public / "asset.txt").unlink()
+    os.symlink(private / "asset.txt", public / "asset.txt")
+
+    with pytest.raises(HTTPException) as exc_info:
+        anyio.run(app.get_response, "asset.txt", {"method": "GET"})
+
+    assert exc_info.value.status_code == 404
+
+
+def test_staticfiles_bound_file_is_closed_after_request(
+    tmp_path: Path, test_client_factory: TestClientFactory
+) -> None:
+    (tmp_path / "example.txt").write_text("<file content>")
+    app = StaticFiles(directory=tmp_path)
+
+    result: dict[str, object] = {}
+
+    async def track_response(scope: Scope, receive: Receive, send: Send) -> None:
+        response = await app.get_response("example.txt", scope)
+        result["file"] = response.file
+        await response(scope, receive, send)
+
+    client = test_client_factory(track_response)
+    response = client.get("/example.txt")
+    assert response.status_code == 200
+    assert result["file"] is not None
+    assert result["file"].closed  # type: ignore[union-attr]
+
